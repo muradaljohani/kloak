@@ -66,11 +66,19 @@ func (r *SecretReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctr
 		// But if just disabled, we should delete it manually.
 		if !enabled {
 			var shadowSecret corev1.Secret
-			if err := r.Get(ctx, shadowNamespacedName, &shadowSecret); err == nil {
-				log.Infow("Deleting disabled shadow secret", "shadow", shadowName)
-				if err := r.Delete(ctx, &shadowSecret); err != nil {
-					return ctrl.Result{}, fmt.Errorf("failed to delete shadow secret: %w", err)
-				}
+			if err := r.Get(ctx, shadowNamespacedName, &shadowSecret); err != nil {
+				return ctrl.Result{}, client.IgnoreNotFound(err)
+			}
+			if !ownsShadowSecret(&secret, &shadowSecret) {
+				return ctrl.Result{}, nil
+			}
+			log.Infow("Deleting disabled shadow secret", "shadow", shadowName)
+			// Do not delete a replacement or an object whose ownership changed
+			// after the read (including a stale informer-cache read).
+			if err := r.Delete(ctx, &shadowSecret, client.Preconditions{
+				UID: &shadowSecret.UID, ResourceVersion: &shadowSecret.ResourceVersion,
+			}); client.IgnoreNotFound(err) != nil {
+				return ctrl.Result{}, fmt.Errorf("failed to delete shadow secret: %w", err)
 			}
 		}
 		return ctrl.Result{}, nil
@@ -99,6 +107,9 @@ func (r *SecretReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctr
 	var existingShadow corev1.Secret
 	shadowExists := false
 	if err := r.Get(ctx, shadowNamespacedName, &existingShadow); err == nil {
+		if !ownsShadowSecret(&secret, &existingShadow) {
+			return ctrl.Result{}, fmt.Errorf("secret %s already exists and is not a kloak-managed shadow owned by secret %s", shadowNamespacedName, req.NamespacedName)
+		}
 		shadowExists = true
 	} else if !errors.IsNotFound(err) {
 		return ctrl.Result{}, fmt.Errorf("failed to get shadow secret: %w", err)
@@ -206,7 +217,7 @@ func (r *SecretReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctr
 
 	if shadowExists {
 		existingShadow.Data = newData
-		// Ensure ownership is set (in case it was created manually or missing)
+		// Only a shadow already owned by this Secret may be updated.
 		existingShadow.OwnerReferences = shadowSecret.OwnerReferences
 		existingShadow.Labels = shadowSecret.Labels
 		if err := r.Update(ctx, &existingShadow); err != nil {
@@ -221,6 +232,16 @@ func (r *SecretReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctr
 	}
 
 	return ctrl.Result{}, nil
+}
+
+// ownsShadowSecret requires both Kloak's managed marker and the current
+// Secret's controller reference. A matching name or owner label alone must
+// never authorize overwriting or deleting another Secret.
+func ownsShadowSecret(secret, shadow *corev1.Secret) bool {
+	owner := metav1.GetControllerOf(shadow)
+	return shadow.Labels[k8ssecrets.LabelManaged] == "true" && owner != nil &&
+		owner.APIVersion == "v1" && owner.Kind == "Secret" &&
+		owner.Name == secret.Name && owner.UID == secret.UID
 }
 
 // isPrefixUsed checks if a prefix is already used in the given shadows.
